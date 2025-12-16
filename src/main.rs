@@ -59,11 +59,19 @@ where
 
 async fn proxy_stdin(mut stdin: ChildStdin, mut input: broadcast::Receiver<String>) {
     while let Ok(message) = input.recv().await {
-        stdin
-            .write_all(format!("Content-Length: {}\r\n\r\n", message.len()).as_bytes())
-            .await
-            .unwrap();
-        stdin.write_all(message.as_bytes()).await.unwrap();
+        let header = format!("Content-Length: {}\r\n\r\n", message.len());
+        if let Err(e) = stdin.write_all(header.as_bytes()).await {
+             debug!("Failed to write header to child stdin: {}", e);
+             break;
+        }
+        if let Err(e) = stdin.write_all(message.as_bytes()).await {
+             debug!("Failed to write body to child stdin: {}", e);
+             break;
+        }
+        if let Err(e) = stdin.flush().await {
+             debug!("Failed to flush child stdin: {}", e);
+             break;
+        }
     }
 }
 
@@ -145,6 +153,7 @@ async fn run(config: LspConfig) -> Result<()> {
                 .await
                 .unwrap();
             stdout.write_all(message.as_bytes()).await.unwrap();
+            stdout.flush().await.unwrap();
         }
     });
 

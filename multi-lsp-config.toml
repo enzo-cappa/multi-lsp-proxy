@@ -1,0 +1,13 @@
+log-file="/home/zherk/workspace/multi-lsp-proxy/logs.log"
+
+[[language]]
+name = "python"
+command = "uvx"
+args = ["ty", "server"]
+
+
+
+# [[language]]
+# name = "python"
+# command = "uvx"
+# args = ["ruff", "server"]
