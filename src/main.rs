@@ -20,25 +20,18 @@ use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 
 use self::config::LspConfig;
 use json_patch::merge;
-use std::collections::HashSet;
 use tokio::sync::RwLock;
 
 // Define the types used
-type Capability = String;
 type Message = String;
 type ChildId = usize;
-
-struct ChildState {
-    stdin_sender: mpsc::Sender<Message>,
-    capabilities: HashSet<Capability>,
-}
 
 // The central, shared state manager
 type CapabilityManager = Arc<RwLock<HashMap<ChildId, Value>>>;
 
 mod config;
 
-type RequestId = u64; // Or a simple counter
+type RequestId = String; // Use string representation to handle both numbers and strings
 
 struct InFlightRequest {
     expected_responses: usize,
@@ -49,11 +42,6 @@ struct InFlightRequest {
 
 type RequestRegistry = Arc<RwLock<HashMap<RequestId, InFlightRequest>>>;
 
-#[derive(Debug, Clone)]
-struct Server {
-    capabilities: Vec<String>,
-}
-
 async fn read_content_length<T>(reader: &mut BufReader<T>) -> Result<usize>
 where
     BufReader<T>: AsyncBufReadExt,
@@ -62,7 +50,10 @@ where
     let mut content_length = 0;
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            bail!("Connection closed");
+        }
         trace!("read line: {}", line);
         if let Some(content) = line.strip_prefix("Content-Length: ") {
             content_length = content
@@ -80,19 +71,17 @@ where
     Ok(content_length)
 }
 
-async fn read_out_message<T>(reader: &mut BufReader<T>) -> Value
+async fn read_out_message<T>(reader: &mut BufReader<T>) -> Result<Value>
 where
     BufReader<T>: AsyncBufReadExt,
     T: Unpin,
 {
-    let content_length = read_content_length(reader).await.unwrap();
+    let content_length = read_content_length(reader).await?;
     let mut body = vec![0u8; content_length];
-    reader.read_exact(&mut body).await.unwrap();
+    reader.read_exact(&mut body).await?;
     let body_str = String::from_utf8_lossy(&body);
     trace!("read body: {}", body_str);
-    serde_json::from_slice(&body)
-        .context("Failed to parse input as LSP data")
-        .unwrap()
+    serde_json::from_slice(&body).context("Failed to parse input as LSP data")
 }
 
 async fn proxy_stdin(mut stdin: ChildStdin, mut input: broadcast::Receiver<String>) {
@@ -133,23 +122,33 @@ async fn proxy_message(
     manager: &CapabilityManager,
     registry: &RequestRegistry,
 ) {
-    let guard = manager.read().await;
-    if !guard.contains_key(&child_id) {
-        drop(guard);
-        let mut guard = manager.write().await;
-        if !guard.contains_key(&child_id)
-            && let Some(result) = reply.get("result")
-            && let Some(capabilities) = result.get("capabilities")
-        {
-            let capabilities = capabilities.clone();
-            guard.insert(child_id, capabilities);
+    // Discover capabilities on initialization
+    {
+        let guard = manager.read().await;
+        if !guard.contains_key(&child_id) {
+            drop(guard);
+            let mut guard = manager.write().await;
+            if !guard.contains_key(&child_id) {
+                if let Some(result) = reply.get("result") {
+                    if let Some(capabilities) = result.get("capabilities") {
+                        guard.insert(child_id, capabilities.clone());
+                    }
+                }
+            }
         }
     }
 
-    let id = reply["id"].as_u64().unwrap();
+    let id_val = reply.get("id").cloned().unwrap_or(Value::Null);
+    if id_val.is_null() {
+        // This is a notification, forward it
+        let _ = tx.send(serde_json::to_string(&reply).unwrap()).await;
+        return;
+    }
+
+    let id_str = id_val.to_string();
     let mut reg_guard = registry.write().await;
 
-    if let Entry::Occupied(mut occupied_entry) = reg_guard.entry(id) {
+    if let Entry::Occupied(mut occupied_entry) = reg_guard.entry(id_str) {
         let req = occupied_entry.get_mut();
         req.collected_responses.push(reply);
         if req.collected_responses.len() >= req.expected_responses {
@@ -160,8 +159,8 @@ async fn proxy_message(
                 .send(serde_json::to_string(&merged).unwrap());
         }
     } else {
-        info!("Untracked response receive, id {}", id);
-        tx.send(serde_json::to_string(&reply).unwrap());
+        // Untracked response or a request from server to client
+        let _ = tx.send(serde_json::to_string(&reply).unwrap()).await;
     }
 }
 
@@ -175,15 +174,17 @@ async fn proxy_stdout(
     registry: RequestRegistry,
 ) {
     loop {
-        let message = read_out_message(&mut stdout).await;
-        match message.get("id") {
-            Some(_id) => {
-                proxy_message(message, child_id, &tx, &manager, &registry);
+        match read_out_message(&mut stdout).await {
+            Ok(message) => {
+                if message.get("id").is_some() {
+                    proxy_message(message, child_id, &tx, &manager, &registry).await;
+                } else {
+                    let _ = tx.send(serde_json::to_string(&message).unwrap()).await;
+                }
             }
-            None => {
-                tx.send(serde_json::to_string(&message).unwrap())
-                    .await
-                    .unwrap();
+            Err(e) => {
+                debug!("Child {} stdout closed: {}", child_id, e);
+                break;
             }
         }
     }
@@ -209,14 +210,16 @@ async fn run(config: LspConfig) -> Result<()> {
             .init();
     }
 
-    let (tx, rx) = broadcast::channel(100);
+    let (tx, _rx) = broadcast::channel(100);
+    let (merged_tx, merged_rx) = mpsc::channel(100);
     let mut child_processes = Vec::new();
     let mut child_rxs = Vec::with_capacity(config.languages.len());
     let cap_manager = Arc::new(RwLock::new(HashMap::new()));
     let req_reg = Arc::new(RwLock::new(HashMap::new()));
     let mut rng = rand::rng();
+
     for lang in &config.languages {
-        let child_id: ChildId = usize::from_ne_bytes(rng.random());
+        let child_id: ChildId = rng.random();
         // spawn LSP server command
         let mut cmd = Command::new(&lang.command);
         cmd.args(&lang.args)
@@ -238,33 +241,42 @@ async fn run(config: LspConfig) -> Result<()> {
             proxy_stdin(child_stdin, rx).await;
         });
         let manager_clone = Arc::clone(&cap_manager);
+        let req_reg_clone = Arc::clone(&req_reg);
         tokio::spawn(async move {
-            proxy_stdout(child_id, child_stdout, child_tx, manager_clone, req_reg).await
+            proxy_stdout(child_id, child_stdout, child_tx, manager_clone, req_reg_clone).await
         });
 
         // Keep child process alive
         child_processes.push(child);
     }
 
-    // read messages from child LSPs
-    // TODO: merge server capabilities?
+    // Centralized task to write all messages to stdout
+    let num_langs = config.languages.len();
     tokio::spawn(async move {
         let mut stdout = io::stdout();
-
         let mut map: StreamMap<usize, ReceiverStream<String>> = StreamMap::new();
 
         for (key, rx) in child_rxs.into_iter().enumerate() {
             map.insert(key, ReceiverStream::new(rx));
         }
-        while let Some((_, value)) = map.next().await {
-            let message = serde_json::to_string(&value).unwrap();
-            debug!("received from child: {}", message);
-            stdout
-                .write_all(format!("Content-Length: {}\r\n\r\n", message.len()).as_bytes())
-                .await
-                .unwrap();
-            stdout.write_all(message.as_bytes()).await.unwrap();
-            stdout.flush().await.unwrap();
+        // Add the merged responses stream
+        map.insert(num_langs, ReceiverStream::new(merged_rx));
+
+        while let Some((_, message)) = map.next().await {
+            debug!("sending to client: {}", message);
+            let header = format!("Content-Length: {}\r\n\r\n", message.len());
+            if let Err(e) = stdout.write_all(header.as_bytes()).await {
+                debug!("Failed to write header to stdout: {}", e);
+                break;
+            }
+            if let Err(e) = stdout.write_all(message.as_bytes()).await {
+                debug!("Failed to write body to stdout: {}", e);
+                break;
+            }
+            if let Err(e) = stdout.flush().await {
+                debug!("Failed to flush stdout: {}", e);
+                break;
+            }
         }
     });
 
@@ -272,55 +284,67 @@ async fn run(config: LspConfig) -> Result<()> {
     // Read new command, send to all child LSP servers
     let mut stdin = BufReader::new(io::stdin());
     loop {
-        let content_length = read_content_length(&mut stdin).await?;
+        let content_length = match read_content_length(&mut stdin).await {
+            Ok(len) => len,
+            Err(e) => {
+                info!("Stdin closed: {}", e);
+                break;
+            }
+        };
         let mut body = vec![0u8; content_length];
-        stdin.read_exact(&mut body).await.unwrap();
+        if let Err(e) = stdin.read_exact(&mut body).await {
+            debug!("Failed to read body from stdin: {}", e);
+            break;
+        }
         let raw = String::from_utf8(body)?;
         let message: Value = serde_json::from_str(&raw)?;
-        if let Some(id) = message["id"].as_u64() {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            {
-                let mut reg_guard = req_reg.write().await;
-                reg_guard.insert(
-                    id,
-                    InFlightRequest {
-                        expected_responses: config.languages.len(),
-                        collected_responses: Vec::new(),
-                        response_tx: tx,
-                    },
-                );
-            }
-            let req_reg_clone = req_reg.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                        result = rx => {
-                            match result {
-                                Ok(response_str) => {
-                                // Send response_str back to stdout here
-                                println!("{}", response_str);
-                            }
-                            Err(_) => {
-                                eprintln!("Sender dropped - likely child task failed");
-                            }
-                        }
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                        // Timeout logic
-                        let mut reg_guard = req_reg_clone.write().await;
-                        if let Some(req) = reg_guard.remove(&id) {
-                            let merged = merge_values(&req.collected_responses);
-                            let final_json = serde_json::to_string(&merged).unwrap();
-                            println!("{}", final_json);
-                        }
-                    }
+
+        // If it's a request (has ID and Method), track it
+        if let Some(id) = message.get("id") {
+            if message.get("method").is_some() {
+                let id_str = id.to_string();
+                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                {
+                    let mut reg_guard = req_reg.write().await;
+                    reg_guard.insert(
+                        id_str.clone(),
+                        InFlightRequest {
+                            expected_responses: config.languages.len(),
+                            collected_responses: Vec::new(),
+                            response_tx: resp_tx,
+                        },
+                    );
                 }
-            });
-            tx.send(raw.clone()).unwrap();
-        } else {
-            // Handle notifications (no ID)
-            tx.send(raw.clone()).unwrap();
+                let req_reg_clone = req_reg.clone();
+                let merged_tx_clone = merged_tx.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        result = resp_rx => {
+                            if let Ok(response_str) = result {
+                                let _ = merged_tx_clone.send(response_str).await;
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                            // Timeout logic
+                            let mut reg_guard = req_reg_clone.write().await;
+                            if let Some(req) = reg_guard.remove(&id_str) {
+                                if !req.collected_responses.is_empty() {
+                                    let merged = merge_values(&req.collected_responses);
+                                    let _ = merged_tx_clone.send(serde_json::to_string(&merged).unwrap()).await;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        // Broadcast the raw message to all children
+        if let Err(e) = tx.send(raw) {
+            debug!("Failed to broadcast message to children: {}", e);
         }
     }
+    Ok(())
 }
 
 #[derive(Debug, Parser)]
