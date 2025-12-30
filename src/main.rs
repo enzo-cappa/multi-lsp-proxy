@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::fs;
 use std::path::PathBuf;
@@ -11,7 +12,7 @@ use std::{collections::HashMap, fmt};
 use tokio::{
     io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{ChildStdin, ChildStdout, Command},
-    sync::{broadcast, mpsc},
+    sync::mpsc,
 };
 use tracing::{debug, info, trace};
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
@@ -40,21 +41,65 @@ impl fmt::Display for LspId {
 }
 type RequestId = LspId;
 
+type ChildRequest = (RequestId, ChildId);
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Message {
+    Request { id: LspId, method: String },
+    Response { id: LspId, result: Value },
+    Error { id: LspId, error: Value },
+    Notification {},
+}
+
+struct ServerSkills {
+    capabilities: Option<lsp_types::ServerCapabilities>,
+    tx: mpsc::Sender<Value>,
+}
+
+fn server_supports_method(caps: &lsp_types::ServerCapabilities, method: &str) -> bool {
+    match method {
+        "textDocument/hover" => caps.hover_provider.is_some(),
+        "textDocument/definition" => caps.definition_provider.is_some(),
+        "textDocument/references" => caps.references_provider.is_some(),
+        "textDocument/rename" => caps.rename_provider.is_some(),
+        "textDocument/formatting" => caps.document_formatting_provider.is_some(),
+        "textDocument/completion" => caps.completion_provider.is_some(),
+        "textDocument/signatureHelp" => caps.signature_help_provider.is_some(),
+        "textDocument/codeAction" => caps.code_action_provider.is_some(),
+        // Notifications and initialize should always return true or be handled separately
+        _ => true,
+    }
+}
+
 struct InFlightRequest {
     expected_responses: usize,
     collected_responses: Vec<Value>,
+    is_initialize: bool,
 }
 
 enum RegistryCommand {
-    /// From stdin: "I'm sending a request with this ID, expect N replies."
-    RegisterRequest {
+    /// From the self-spawned timer: "Time is up, send what you've got."
+    CheckTimeout {
         id: RequestId,
-        expected_count: usize,
     },
     /// From a child server: "Here is one of the responses for RequestID."
-    PushResponse { id: RequestId, response: Value },
-    /// From the self-spawned timer: "Time is up, send what you've got."
-    CheckTimeout { id: RequestId },
+    PushResponse {
+        id: RequestId,
+        child_id: ChildId,
+        response: Value,
+    },
+    RegisterServerRequest {
+        id: RequestId,
+        child_id: ChildId,
+    },
+    RegisterServer {
+        id: ChildId,
+        tx: mpsc::Sender<Value>,
+    },
+    RouteMessage {
+        message: Value,
+    },
 }
 
 #[derive(Clone)]
@@ -63,24 +108,35 @@ struct RegistryHandle {
 }
 
 impl RegistryHandle {
-    pub async fn register(&self, id: RequestId, expected: usize) {
-        debug!("Registering request {}", id);
-        let _ = self
-            .tx
-            .send(RegistryCommand::RegisterRequest {
-                id,
-                expected_count: expected,
-            })
-            .await;
-    }
-
-    pub async fn push(&self, id: RequestId, response: Value) {
+    pub async fn push_response(&self, id: RequestId, child_id: ChildId, response: Value) {
         let _ = self
             .tx
             .send(RegistryCommand::PushResponse {
                 id,
-                response: response,
+                child_id,
+                response,
             })
+            .await;
+    }
+
+    pub async fn register_server_request(&self, id: RequestId, child_id: ChildId) {
+        let _ = self
+            .tx
+            .send(RegistryCommand::RegisterServerRequest { id, child_id })
+            .await;
+    }
+
+    pub async fn route(&self, message: Value) {
+        let _ = self
+            .tx
+            .send(RegistryCommand::RouteMessage { message })
+            .await;
+    }
+
+    pub async fn add_server(&self, child_id: ChildId, tx: mpsc::Sender<Value>) {
+        let _ = self
+            .tx
+            .send(RegistryCommand::RegisterServer { id: child_id, tx })
             .await;
     }
 }
@@ -91,6 +147,8 @@ struct RegistryActor {
     self_sender: mpsc::Sender<RegistryCommand>,
     output_tx: mpsc::Sender<String>,
     requests: HashMap<RequestId, InFlightRequest>,
+    server_requests: HashSet<ChildRequest>,
+    servers: HashMap<ChildId, ServerSkills>,
 }
 
 impl RegistryActor {
@@ -101,36 +159,107 @@ impl RegistryActor {
             self_sender: tx.clone(),
             output_tx,
             requests: HashMap::new(),
+            servers: HashMap::new(),
+            server_requests: HashSet::new(),
         };
         let handle = RegistryHandle { tx };
         (actor, handle)
     }
 
+    async fn handle_route(&mut self, message: Value) {
+        let request: Message = serde_json::from_value(message.clone()).unwrap();
+        let mut targets = Vec::new();
+        let mut req_id: Option<&LspId> = None;
+        let mut is_initialize = false;
+
+        for (child_id, server) in self.servers.iter() {
+            match request {
+                Message::Notification { .. } => {
+                    targets.push(server.tx.clone());
+                }
+                Message::Response { ref id, result: _ } => {
+                    if self.server_requests.remove(&(id.clone(), child_id.clone())) {
+                        targets.push(server.tx.clone());
+                        break;
+                    }
+                }
+                Message::Error { .. } => {
+                    targets.push(server.tx.clone());
+                }
+                Message::Request { ref id, ref method } => {
+                    req_id = Some(id);
+                    if method == "initialize" {
+                        targets.push(server.tx.clone());
+                        is_initialize = true;
+                    } else if let Some(caps) = &server.capabilities {
+                        if server_supports_method(&caps, &method) {
+                            targets.push(server.tx.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Now we know exactly how many responses to expect!
+        if req_id.is_some() {
+            self.register_internal(req_id.unwrap().clone(), targets.len(), is_initialize);
+        }
+
+        for tx in targets {
+            let _ = tx.send(message.clone()).await;
+        }
+    }
+
+    fn register_internal(&mut self, id: LspId, expected_count: usize, is_initiliaze: bool) {
+        let inflight = InFlightRequest {
+            expected_responses: expected_count,
+            collected_responses: Vec::with_capacity(expected_count),
+            is_initialize: is_initiliaze,
+        };
+        let id_to_check = id.clone();
+        self.requests.insert(id, inflight);
+        let registry_tx = self.self_sender.clone();
+        tokio::spawn(async move {
+            _ = tokio::time::sleep(Duration::from_secs(5)).await;
+            _ = registry_tx
+                .send(RegistryCommand::CheckTimeout { id: id_to_check })
+                .await;
+        });
+    }
+
     pub async fn run(mut self) {
         while let Some(cmd) = self.inbox.recv().await {
             match cmd {
-                RegistryCommand::RegisterRequest { id, expected_count } => {
-                    let inflight = InFlightRequest {
-                        expected_responses: expected_count,
-                        collected_responses: Vec::with_capacity(expected_count),
-                    };
-                    let id_to_check = id.clone();
-                    self.requests.insert(id, inflight);
-                    let registry_tx = self.self_sender.clone();
-                    tokio::spawn(async move {
-                        _ = tokio::time::sleep(Duration::from_secs(5)).await;
-                        _ = registry_tx
-                            .send(RegistryCommand::CheckTimeout { id: id_to_check })
-                            .await;
-                    });
-                }
-                RegistryCommand::PushResponse { id, response } => {
+                RegistryCommand::PushResponse {
+                    id,
+                    child_id,
+                    response,
+                } => {
                     let id_clone = id.clone();
                     if let Entry::Occupied(mut occupied_entry) = self.requests.entry(id) {
                         let req = occupied_entry.get_mut();
                         req.collected_responses.push(response);
                         if req.collected_responses.len() >= req.expected_responses {
                             let finished_req = occupied_entry.remove();
+                            if finished_req.is_initialize {
+                                for row in finished_req.collected_responses.iter() {
+                                    if let Some(caps_json) =
+                                        row.get("result").and_then(|r| r.get("capabilities"))
+                                    {
+                                        let caps: lsp_types::ServerCapabilities =
+                                            serde_json::from_value(caps_json.clone())
+                                                .unwrap_or_default();
+                                        let current = self.servers.remove(&child_id).unwrap();
+                                        self.servers.insert(
+                                            child_id,
+                                            ServerSkills {
+                                                capabilities: Some(caps),
+                                                ..current
+                                            },
+                                        );
+                                    }
+                                }
+                            }
                             let merged = merge_values(&finished_req.collected_responses, id_clone);
                             let _ = self
                                 .output_tx
@@ -156,6 +285,19 @@ impl RegistryActor {
                             .await
                             .context("Output task died");
                     }
+                }
+                RegistryCommand::RegisterServer { id, tx } => {
+                    self.servers.insert(
+                        id,
+                        ServerSkills {
+                            tx,
+                            capabilities: None,
+                        },
+                    );
+                }
+                RegistryCommand::RouteMessage { message } => self.handle_route(message).await,
+                RegistryCommand::RegisterServerRequest { id, child_id } => {
+                    self.server_requests.insert((id, child_id));
                 }
             }
         }
@@ -188,10 +330,10 @@ where
     content_length.ok_or_else(|| anyhow!("Missing Content-Length header"))
 }
 
-async fn child_stdin_worker(mut stdin: ChildStdin, mut input: broadcast::Receiver<Value>) {
+async fn child_stdin_worker(mut stdin: ChildStdin, mut input: mpsc::Receiver<Value>) {
     loop {
         match input.recv().await {
-            Ok(message) => {
+            Some(message) => {
                 let message_bytes = serde_json::to_vec(&message).unwrap();
                 let header = format!("Content-Length: {}\r\n\r\n", message_bytes.len());
 
@@ -205,11 +347,7 @@ async fn child_stdin_worker(mut stdin: ChildStdin, mut input: broadcast::Receive
                     break;
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(count)) => {
-                debug!("Child stdin worker lagged by {} messages", count);
-                // Keep looping! Don't exit.
-            }
-            Err(broadcast::error::RecvError::Closed) => {
+            None => {
                 // The main loop dropped the sender, time to shut down.
                 break;
             }
@@ -281,12 +419,13 @@ async fn child_stdout_worker(
         match message {
             Ok(message) => {
                 if let Some(id_val) = message.get("id") {
+                    let lsp_id: LspId = serde_json::from_value(id_val.clone()).unwrap();
                     if !message.get("method").is_some() {
                         debug!("got response for message: {}", id_val);
-                        let lsp_id: LspId = serde_json::from_value(id_val.clone()).unwrap();
-                        handle.push(lsp_id, message).await
+                        handle.push_response(lsp_id, child_id, message).await
                     } else {
                         debug!("got request from server: {}", id_val);
+                        handle.register_server_request(lsp_id, child_id).await;
                         let _ = output_tx
                             .send(serde_json::to_string(&message).unwrap())
                             .await;
@@ -352,11 +491,10 @@ async fn run(config: LspConfig) -> Result<()> {
     let (registry_actor, registry_handle) = RegistryActor::new(output_tx.clone());
     tokio::spawn(registry_actor.run());
 
-    // broadcast channel: main stdin to child stdins
-    let (broadcast_tx, _) = broadcast::channel::<Value>(100);
-    let lang_count = config.languages.len();
     // spawn servers
     for (child_id, lang) in config.languages.into_iter().enumerate() {
+        let (stdin_tx, stdin_rx) = mpsc::channel::<Value>(100);
+        registry_handle.add_server(child_id, stdin_tx).await;
         // spawn LSP server command
         let mut cmd = Command::new(&lang.command);
         let mut child = cmd
@@ -370,9 +508,8 @@ async fn run(config: LspConfig) -> Result<()> {
         let child_stdin = child.stdin.take().unwrap();
         let child_stdout = child.stdout.take().unwrap();
 
-        let user_input_rx = broadcast_tx.subscribe();
         tokio::spawn(async move {
-            child_stdin_worker(child_stdin, user_input_rx).await;
+            child_stdin_worker(child_stdin, stdin_rx).await;
         });
         let child_output = output_tx.clone();
         let handle = registry_handle.clone();
@@ -399,15 +536,7 @@ async fn run(config: LspConfig) -> Result<()> {
         }
         let raw = String::from_utf8(body)?;
         let message: Value = serde_json::from_str(&raw)?;
-        if let Some(id_val) = message.get("id") {
-            if let Ok(lsp_id) = serde_json::from_value(id_val.clone()) {
-                // Only register if it's a request (has an id AND a method)
-                if message.get("method").is_some() {
-                    registry_handle.register(lsp_id, lang_count).await;
-                }
-            }
-        }
-        broadcast_tx.send(message).unwrap();
+        registry_handle.route(message).await;
     }
     Ok(())
 }
