@@ -14,11 +14,12 @@ use tokio::{
     process::{ChildStdin, ChildStdout, Command},
     sync::mpsc,
 };
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 
 use self::config::LspConfig;
 use json_patch::merge;
+use lsp_types::*;
 
 // Define the types used
 type ChildId = usize;
@@ -53,22 +54,84 @@ enum Message {
 }
 
 struct ServerSkills {
-    capabilities: Option<lsp_types::ServerCapabilities>,
+    capabilities: Option<ServerCapabilities>,
     tx: mpsc::Sender<Value>,
 }
 
-fn server_supports_method(caps: &lsp_types::ServerCapabilities, method: &str) -> bool {
-    match method {
-        "textDocument/hover" => caps.hover_provider.is_some(),
-        "textDocument/definition" => caps.definition_provider.is_some(),
-        "textDocument/references" => caps.references_provider.is_some(),
-        "textDocument/rename" => caps.rename_provider.is_some(),
-        "textDocument/formatting" => caps.document_formatting_provider.is_some(),
-        "textDocument/completion" => caps.completion_provider.is_some(),
-        "textDocument/signatureHelp" => caps.signature_help_provider.is_some(),
-        "textDocument/codeAction" => caps.code_action_provider.is_some(),
-        // Notifications and initialize should always return true or be handled separately
-        _ => true,
+pub struct LspRouter;
+
+impl LspRouter {
+    pub fn server_supports_method(caps: &ServerCapabilities, method: &str) -> bool {
+        debug!("checking caps. method {} caps {:?}", method, caps);
+        match method {
+            // --- Basic Query Providers ---
+            "textDocument/hover" => caps.hover_provider.is_some(),
+            "textDocument/definition" => caps.definition_provider.is_some(),
+            "textDocument/typeDefinition" => caps.type_definition_provider.is_some(),
+            "textDocument/implementation" => caps.implementation_provider.is_some(),
+            "textDocument/references" => caps.references_provider.is_some(),
+            "textDocument/documentHighlight" => caps.document_highlight_provider.is_some(),
+            "textDocument/documentSymbol" => caps.document_symbol_provider.is_some(),
+
+            // --- Editing & Refactoring ---
+            "textDocument/completion" => caps.completion_provider.is_some(),
+            "textDocument/signatureHelp" => caps.signature_help_provider.is_some(),
+            "textDocument/codeAction" => caps.code_action_provider.is_some(),
+            "textDocument/codeLens" => caps.code_lens_provider.is_some(),
+            "textDocument/formatting" => caps.document_formatting_provider.is_some(),
+            "textDocument/rangeFormatting" => caps.document_range_formatting_provider.is_some(),
+            "textDocument/onTypeFormatting" => caps.document_on_type_formatting_provider.is_some(),
+            "textDocument/rename" => caps.rename_provider.is_some(),
+            "textDocument/prepareRename" => caps.rename_provider.is_some(),
+            "textDocument/documentLink" => caps.document_link_provider.is_some(),
+
+            // --- Semantic Tokens (Nested Logic) ---
+            m if m.starts_with("textDocument/semanticTokens") => {
+                match (caps.semantic_tokens_provider.as_ref(), m) {
+                    (Some(p), "textDocument/semanticTokens/full") => Self::check_semantic_full(p),
+                    (Some(p), "textDocument/semanticTokens/range") => Self::check_semantic_range(p),
+                    (Some(_), _) => true, // Default true for other semantic sub-methods if provider exists
+                    _ => false,
+                }
+            }
+
+            // --- Workspace ---
+            "workspace/symbol" => caps.workspace_symbol_provider.is_some(),
+            "workspace/executeCommand" => caps.execute_command_provider.is_some(),
+
+            // --- Notifications (Lifecycle & State) ---
+            // These should almost always be broadcast to all servers to keep their
+            // internal virtual file systems in sync.
+            "textDocument/didOpen"
+            | "textDocument/didChange"
+            | "textDocument/didSave"
+            | "textDocument/didClose"
+            | "initialized"
+            | "exit" => true,
+
+            // --- Default Fallback ---
+            // If it's a $/ method (private/custom) or something unknown,
+            // broadcasting is usually safer than dropping.
+            _ => true,
+        }
+    }
+
+    fn check_semantic_full(p: &SemanticTokensServerCapabilities) -> bool {
+        match p {
+            SemanticTokensServerCapabilities::SemanticTokensOptions(opt) => opt.full.is_some(),
+            SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(reg) => {
+                reg.semantic_tokens_options.full.is_some()
+            }
+        }
+    }
+
+    fn check_semantic_range(p: &SemanticTokensServerCapabilities) -> bool {
+        match p {
+            SemanticTokensServerCapabilities::SemanticTokensOptions(opt) => opt.range.is_some(),
+            SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(reg) => {
+                reg.semantic_tokens_options.range.is_some()
+            }
+        }
     }
 }
 
@@ -109,6 +172,7 @@ struct RegistryHandle {
 
 impl RegistryHandle {
     pub async fn push_response(&self, id: RequestId, child_id: ChildId, response: Value) {
+        debug!("pushing response! {} {}", id, child_id);
         let _ = self
             .tx
             .send(RegistryCommand::PushResponse {
@@ -192,12 +256,18 @@ impl RegistryActor {
                         targets.push(server.tx.clone());
                         is_initialize = true;
                     } else if let Some(caps) = &server.capabilities {
-                        if server_supports_method(&caps, &method) {
+                        if LspRouter::server_supports_method(&caps, &method) {
+                            debug!("sending request to server {} {}", child_id, method);
                             targets.push(server.tx.clone());
                         }
                     }
                 }
             }
+        }
+
+        if targets.len() == 0 {
+            warn!("No target found! message {}", message);
+            return;
         }
 
         // Now we know exactly how many responses to expect!
@@ -211,6 +281,7 @@ impl RegistryActor {
     }
 
     fn register_internal(&mut self, id: LspId, expected_count: usize, is_initiliaze: bool) {
+        debug!("registering request {}", id);
         let inflight = InFlightRequest {
             expected_responses: expected_count,
             collected_responses: Vec::with_capacity(expected_count),
@@ -235,31 +306,34 @@ impl RegistryActor {
                     child_id,
                     response,
                 } => {
+                    debug!("in actor! PushResponse {} {}", id, child_id);
                     let id_clone = id.clone();
                     if let Entry::Occupied(mut occupied_entry) = self.requests.entry(id) {
                         let req = occupied_entry.get_mut();
+                        if req.is_initialize {
+                            debug!("is initialize {}", response);
+                            if let Some(result) = response.get("result")
+                                && let Some(caps_json) = result.get("capabilities")
+                            {
+                                let caps: ServerCapabilities =
+                                    serde_json::from_value(caps_json.clone()).unwrap_or_default();
+                                debug!(
+                                    "found capabilities child id: {}; caps {:?}",
+                                    child_id, caps
+                                );
+                                let current = self.servers.remove(&child_id).unwrap();
+                                self.servers.insert(
+                                    child_id,
+                                    ServerSkills {
+                                        capabilities: Some(caps),
+                                        ..current
+                                    },
+                                );
+                            }
+                        }
                         req.collected_responses.push(response);
                         if req.collected_responses.len() >= req.expected_responses {
                             let finished_req = occupied_entry.remove();
-                            if finished_req.is_initialize {
-                                for row in finished_req.collected_responses.iter() {
-                                    if let Some(caps_json) =
-                                        row.get("result").and_then(|r| r.get("capabilities"))
-                                    {
-                                        let caps: lsp_types::ServerCapabilities =
-                                            serde_json::from_value(caps_json.clone())
-                                                .unwrap_or_default();
-                                        let current = self.servers.remove(&child_id).unwrap();
-                                        self.servers.insert(
-                                            child_id,
-                                            ServerSkills {
-                                                capabilities: Some(caps),
-                                                ..current
-                                            },
-                                        );
-                                    }
-                                }
-                            }
                             let merged = merge_values(&finished_req.collected_responses, id_clone);
                             let _ = self
                                 .output_tx
@@ -315,7 +389,6 @@ where
         if n == 0 {
             bail!("Connection closed");
         }
-        trace!("read line: {}", line);
         let trimmed = line.trim();
         if trimmed.is_empty() {
             // We hit the empty line (\r\n\r\n separator)
@@ -412,8 +485,6 @@ async fn child_stdout_worker(
         };
         let mut body = vec![0u8; content_length];
         stdout_reader.read_exact(&mut body).await.unwrap();
-        let body_str = String::from_utf8_lossy(&body);
-        debug!("read body: {}", body_str);
         let message: Result<Value> =
             serde_json::from_slice(&body).context("Failed to parse input as LSP data");
         match message {
@@ -421,17 +492,17 @@ async fn child_stdout_worker(
                 if let Some(id_val) = message.get("id") {
                     let lsp_id: LspId = serde_json::from_value(id_val.clone()).unwrap();
                     if !message.get("method").is_some() {
-                        debug!("got response for message: {}", id_val);
+                        debug!("got response from child_id: {} {}", child_id, message);
                         handle.push_response(lsp_id, child_id, message).await
                     } else {
-                        debug!("got request from server: {}", id_val);
+                        debug!("got request from child_id: {} {}", child_id, message);
                         handle.register_server_request(lsp_id, child_id).await;
                         let _ = output_tx
                             .send(serde_json::to_string(&message).unwrap())
                             .await;
                     }
                 } else {
-                    debug!("got notification from server");
+                    debug!("got notification from server: {}", message);
                     let _ = output_tx
                         .send(serde_json::to_string(&message).unwrap())
                         .await;
@@ -448,7 +519,6 @@ async fn child_stdout_worker(
 async fn output_actor(mut rx: mpsc::Receiver<String>) {
     let mut stdout = io::stdout();
     while let Some(message) = rx.recv().await {
-        debug!("sending to main stdout: {}", message);
         let header = format!("Content-Length: {}\r\n\r\n", message.len());
         if let Err(e) = stdout.write_all(header.as_bytes()).await {
             debug!("Failed to write header to stdout: {}", e);
@@ -536,6 +606,7 @@ async fn run(config: LspConfig) -> Result<()> {
         }
         let raw = String::from_utf8(body)?;
         let message: Value = serde_json::from_str(&raw)?;
+        debug!("Got client message: {}", message);
         registry_handle.route(message).await;
     }
     Ok(())
