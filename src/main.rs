@@ -14,7 +14,7 @@ use tokio::{
     process::{ChildStdin, ChildStdout, Command},
     sync::mpsc,
 };
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 
 use self::config::LspConfig;
@@ -304,7 +304,7 @@ impl RegistryActor {
                 RegistryCommand::PushResponse {
                     id,
                     child_id,
-                    response,
+                    mut response,
                 } => {
                     debug!("in actor! PushResponse {} {}", id, child_id);
                     let id_clone = id.clone();
@@ -312,7 +312,7 @@ impl RegistryActor {
                         let req = occupied_entry.get_mut();
                         if req.is_initialize {
                             debug!("is initialize {}", response);
-                            if let Some(result) = response.get("result")
+                            if let Some(result) = response.get_mut("result")
                                 && let Some(caps_json) = result.get("capabilities")
                             {
                                 let caps: ServerCapabilities =
@@ -328,6 +328,15 @@ impl RegistryActor {
                                         capabilities: Some(caps),
                                         ..current
                                     },
+                                );
+                                let repl = result.as_object_mut().expect("Should be an object!");
+                                repl.remove("serverInfo");
+                                repl.insert(
+                                    "serverInfo".to_string(),
+                                    json!({
+                                        "name": "mlp",
+                                        "version": "0.0.1"
+                                    }),
                                 );
                             }
                         }
