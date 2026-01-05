@@ -53,66 +53,80 @@ enum Message {
     Notification {},
 }
 
-struct ServerSkills {
+struct Server {
     capabilities: Option<ServerCapabilities>,
     tx: mpsc::Sender<Value>,
 }
 
-pub struct LspRouter;
+impl Server {
+    pub fn server_supports_method(&self, method: &str) -> bool {
+        trace!(
+            "checking caps. method {} caps {:?}",
+            method, self.capabilities
+        );
+        match self.capabilities.as_ref() {
+            None => false,
+            Some(caps) => {
+                match method {
+                    // --- Basic Query Providers ---
+                    "textDocument/hover" => caps.hover_provider.is_some(),
+                    "textDocument/definition" => caps.definition_provider.is_some(),
+                    "textDocument/typeDefinition" => caps.type_definition_provider.is_some(),
+                    "textDocument/implementation" => caps.implementation_provider.is_some(),
+                    "textDocument/references" => caps.references_provider.is_some(),
+                    "textDocument/documentHighlight" => caps.document_highlight_provider.is_some(),
+                    "textDocument/documentSymbol" => caps.document_symbol_provider.is_some(),
 
-impl LspRouter {
-    pub fn server_supports_method(caps: &ServerCapabilities, method: &str) -> bool {
-        trace!("checking caps. method {} caps {:?}", method, caps);
-        match method {
-            // --- Basic Query Providers ---
-            "textDocument/hover" => caps.hover_provider.is_some(),
-            "textDocument/definition" => caps.definition_provider.is_some(),
-            "textDocument/typeDefinition" => caps.type_definition_provider.is_some(),
-            "textDocument/implementation" => caps.implementation_provider.is_some(),
-            "textDocument/references" => caps.references_provider.is_some(),
-            "textDocument/documentHighlight" => caps.document_highlight_provider.is_some(),
-            "textDocument/documentSymbol" => caps.document_symbol_provider.is_some(),
+                    // --- Editing & Refactoring ---
+                    "textDocument/completion" => caps.completion_provider.is_some(),
+                    "textDocument/signatureHelp" => caps.signature_help_provider.is_some(),
+                    "textDocument/codeAction" => caps.code_action_provider.is_some(),
+                    "textDocument/codeLens" => caps.code_lens_provider.is_some(),
+                    "textDocument/formatting" => caps.document_formatting_provider.is_some(),
+                    "textDocument/rangeFormatting" => {
+                        caps.document_range_formatting_provider.is_some()
+                    }
+                    "textDocument/onTypeFormatting" => {
+                        caps.document_on_type_formatting_provider.is_some()
+                    }
+                    "textDocument/rename" => caps.rename_provider.is_some(),
+                    "textDocument/prepareRename" => caps.rename_provider.is_some(),
+                    "textDocument/documentLink" => caps.document_link_provider.is_some(),
 
-            // --- Editing & Refactoring ---
-            "textDocument/completion" => caps.completion_provider.is_some(),
-            "textDocument/signatureHelp" => caps.signature_help_provider.is_some(),
-            "textDocument/codeAction" => caps.code_action_provider.is_some(),
-            "textDocument/codeLens" => caps.code_lens_provider.is_some(),
-            "textDocument/formatting" => caps.document_formatting_provider.is_some(),
-            "textDocument/rangeFormatting" => caps.document_range_formatting_provider.is_some(),
-            "textDocument/onTypeFormatting" => caps.document_on_type_formatting_provider.is_some(),
-            "textDocument/rename" => caps.rename_provider.is_some(),
-            "textDocument/prepareRename" => caps.rename_provider.is_some(),
-            "textDocument/documentLink" => caps.document_link_provider.is_some(),
+                    // --- Semantic Tokens (Nested Logic) ---
+                    m if m.starts_with("textDocument/semanticTokens") => {
+                        match (caps.semantic_tokens_provider.as_ref(), m) {
+                            (Some(p), "textDocument/semanticTokens/full") => {
+                                Self::check_semantic_full(p)
+                            }
+                            (Some(p), "textDocument/semanticTokens/range") => {
+                                Self::check_semantic_range(p)
+                            }
+                            (Some(_), _) => true, // Default true for other semantic sub-methods if provider exists
+                            _ => false,
+                        }
+                    }
 
-            // --- Semantic Tokens (Nested Logic) ---
-            m if m.starts_with("textDocument/semanticTokens") => {
-                match (caps.semantic_tokens_provider.as_ref(), m) {
-                    (Some(p), "textDocument/semanticTokens/full") => Self::check_semantic_full(p),
-                    (Some(p), "textDocument/semanticTokens/range") => Self::check_semantic_range(p),
-                    (Some(_), _) => true, // Default true for other semantic sub-methods if provider exists
-                    _ => false,
+                    // --- Workspace ---
+                    "workspace/symbol" => caps.workspace_symbol_provider.is_some(),
+                    "workspace/executeCommand" => caps.execute_command_provider.is_some(),
+
+                    // --- Notifications (Lifecycle & State) ---
+                    // These should almost always be broadcast to all servers to keep their
+                    // internal virtual file systems in sync.
+                    "textDocument/didOpen"
+                    | "textDocument/didChange"
+                    | "textDocument/didSave"
+                    | "textDocument/didClose"
+                    | "initialized"
+                    | "exit" => true,
+
+                    // --- Default Fallback ---
+                    // If it's a $/ method (private/custom) or something unknown,
+                    // broadcasting is usually safer than dropping.
+                    _ => true,
                 }
             }
-
-            // --- Workspace ---
-            "workspace/symbol" => caps.workspace_symbol_provider.is_some(),
-            "workspace/executeCommand" => caps.execute_command_provider.is_some(),
-
-            // --- Notifications (Lifecycle & State) ---
-            // These should almost always be broadcast to all servers to keep their
-            // internal virtual file systems in sync.
-            "textDocument/didOpen"
-            | "textDocument/didChange"
-            | "textDocument/didSave"
-            | "textDocument/didClose"
-            | "initialized"
-            | "exit" => true,
-
-            // --- Default Fallback ---
-            // If it's a $/ method (private/custom) or something unknown,
-            // broadcasting is usually safer than dropping.
-            _ => true,
         }
     }
 
@@ -222,7 +236,7 @@ struct RegistryActor {
     output_tx: mpsc::Sender<String>,
     requests: HashMap<RequestId, InFlightRequest>,
     child_requests: HashMap<RequestId, InFlightChildRequest>,
-    child_skills: HashMap<ChildId, ServerSkills>,
+    child_skills: HashMap<ChildId, Server>,
 }
 
 impl RegistryActor {
@@ -280,11 +294,9 @@ impl RegistryActor {
                         if method == "initialize" {
                             targets.push(child.tx.clone());
                             is_initialize = true;
-                        } else if let Some(caps) = &child.capabilities {
-                            if LspRouter::server_supports_method(&caps, &method) {
-                                debug!("sending request to server {} {}", child_id, method);
-                                targets.push(child.tx.clone());
-                            }
+                        } else if child.server_supports_method(method) {
+                            debug!("sending request to server {} {}", child_id, method);
+                            targets.push(child.tx.clone());
                         }
                     }
                 }
@@ -350,7 +362,7 @@ impl RegistryActor {
                                 let current = self.child_skills.remove(&child_id).unwrap();
                                 self.child_skills.insert(
                                     child_id,
-                                    ServerSkills {
+                                    Server {
                                         capabilities: Some(caps),
                                         ..current
                                     },
@@ -398,7 +410,7 @@ impl RegistryActor {
                 RegistryCommand::RegisterChild { id, tx } => {
                     self.child_skills.insert(
                         id,
-                        ServerSkills {
+                        Server {
                             tx,
                             capabilities: None,
                         },
