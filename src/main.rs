@@ -2,7 +2,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::fs;
 use std::path::PathBuf;
@@ -14,7 +13,7 @@ use tokio::{
     process::{ChildStdin, ChildStdout, Command},
     sync::mpsc,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 
 use self::config::LspConfig;
@@ -28,28 +27,29 @@ mod config;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum LspId {
+pub enum RequestId {
     Number(i64),
     String(String),
 }
-impl fmt::Display for LspId {
+impl fmt::Display for RequestId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LspId::Number(n) => write!(f, "{}", n),
-            LspId::String(s) => write!(f, "\"{}\"", s),
+            RequestId::Number(n) => write!(f, "{}", n),
+            RequestId::String(s) => write!(f, "\"{}\"", s),
         }
     }
 }
-type RequestId = LspId;
-
-type ChildRequest = (RequestId, ChildId);
+struct InFlightChildRequest {
+    child_id: ChildId,
+    orig_req_id: RequestId,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum Message {
-    Request { id: LspId, method: String },
-    Response { id: LspId, result: Value },
-    Error { id: LspId, error: Value },
+    Request { id: RequestId, method: String },
+    Response { id: RequestId, result: Value },
+    Error { id: RequestId, error: Value },
     Notification {},
 }
 
@@ -62,7 +62,7 @@ pub struct LspRouter;
 
 impl LspRouter {
     pub fn server_supports_method(caps: &ServerCapabilities, method: &str) -> bool {
-        debug!("checking caps. method {} caps {:?}", method, caps);
+        trace!("checking caps. method {} caps {:?}", method, caps);
         match method {
             // --- Basic Query Providers ---
             "textDocument/hover" => caps.hover_provider.is_some(),
@@ -152,11 +152,12 @@ enum RegistryCommand {
         child_id: ChildId,
         response: Value,
     },
-    RegisterServerRequest {
-        id: RequestId,
+    RegisterChildRequest {
+        orig_id: RequestId,
+        new_id: RequestId,
         child_id: ChildId,
     },
-    RegisterServer {
+    RegisterChild {
         id: ChildId,
         tx: mpsc::Sender<Value>,
     },
@@ -183,10 +184,19 @@ impl RegistryHandle {
             .await;
     }
 
-    pub async fn register_server_request(&self, id: RequestId, child_id: ChildId) {
+    pub async fn register_child_request(
+        &self,
+        new_id: RequestId,
+        orig_id: RequestId,
+        child_id: ChildId,
+    ) {
         let _ = self
             .tx
-            .send(RegistryCommand::RegisterServerRequest { id, child_id })
+            .send(RegistryCommand::RegisterChildRequest {
+                orig_id,
+                new_id,
+                child_id,
+            })
             .await;
     }
 
@@ -200,7 +210,7 @@ impl RegistryHandle {
     pub async fn add_server(&self, child_id: ChildId, tx: mpsc::Sender<Value>) {
         let _ = self
             .tx
-            .send(RegistryCommand::RegisterServer { id: child_id, tx })
+            .send(RegistryCommand::RegisterChild { id: child_id, tx })
             .await;
     }
 }
@@ -211,8 +221,8 @@ struct RegistryActor {
     self_sender: mpsc::Sender<RegistryCommand>,
     output_tx: mpsc::Sender<String>,
     requests: HashMap<RequestId, InFlightRequest>,
-    server_requests: HashSet<ChildRequest>,
-    servers: HashMap<ChildId, ServerSkills>,
+    child_requests: HashMap<RequestId, InFlightChildRequest>,
+    child_skills: HashMap<ChildId, ServerSkills>,
 }
 
 impl RegistryActor {
@@ -223,42 +233,58 @@ impl RegistryActor {
             self_sender: tx.clone(),
             output_tx,
             requests: HashMap::new(),
-            servers: HashMap::new(),
-            server_requests: HashSet::new(),
+            child_skills: HashMap::new(),
+            child_requests: HashMap::new(),
         };
         let handle = RegistryHandle { tx };
         (actor, handle)
     }
 
-    async fn handle_route(&mut self, message: Value) {
+    async fn handle_client_message(&mut self, mut message: Value) {
         let request: Message = serde_json::from_value(message.clone()).unwrap();
         let mut targets = Vec::new();
-        let mut req_id: Option<&LspId> = None;
+        let mut req_id: Option<&RequestId> = None;
         let mut is_initialize = false;
 
-        for (child_id, server) in self.servers.iter() {
-            match request {
-                Message::Notification { .. } => {
-                    targets.push(server.tx.clone());
-                }
-                Message::Response { ref id, result: _ } => {
-                    if self.server_requests.remove(&(id.clone(), child_id.clone())) {
-                        targets.push(server.tx.clone());
-                        break;
+        if let Message::Response { ref id, result: _ } = request {
+            debug!("Got client response, {}", id);
+            if let Some(entry) = self.child_requests.remove_entry(id) {
+                let (req_id, request) = entry;
+                let server = self
+                    .child_skills
+                    .get(&request.child_id)
+                    .expect("Can't find server");
+                let repl = message.as_object_mut().expect("Should be an object!");
+                repl.remove("id");
+                repl.insert(
+                    "id".to_string(),
+                    serde_json::to_value(request.orig_req_id).unwrap(),
+                );
+                let _ = server.tx.send(message.clone()).await;
+                return;
+            } else {
+                warn!("Cant find child request in registry: {}", id);
+            }
+        } else {
+            for (child_id, child) in self.child_skills.iter() {
+                match request {
+                    Message::Notification { .. } => {
+                        targets.push(child.tx.clone());
                     }
-                }
-                Message::Error { .. } => {
-                    targets.push(server.tx.clone());
-                }
-                Message::Request { ref id, ref method } => {
-                    req_id = Some(id);
-                    if method == "initialize" {
-                        targets.push(server.tx.clone());
-                        is_initialize = true;
-                    } else if let Some(caps) = &server.capabilities {
-                        if LspRouter::server_supports_method(&caps, &method) {
-                            debug!("sending request to server {} {}", child_id, method);
-                            targets.push(server.tx.clone());
+                    Message::Response { ref id, result: _ } => {}
+                    Message::Error { .. } => {
+                        targets.push(child.tx.clone());
+                    }
+                    Message::Request { ref id, ref method } => {
+                        req_id = Some(id);
+                        if method == "initialize" {
+                            targets.push(child.tx.clone());
+                            is_initialize = true;
+                        } else if let Some(caps) = &child.capabilities {
+                            if LspRouter::server_supports_method(&caps, &method) {
+                                debug!("sending request to server {} {}", child_id, method);
+                                targets.push(child.tx.clone());
+                            }
                         }
                     }
                 }
@@ -280,7 +306,7 @@ impl RegistryActor {
         }
     }
 
-    fn register_internal(&mut self, id: LspId, expected_count: usize, is_initiliaze: bool) {
+    fn register_internal(&mut self, id: RequestId, expected_count: usize, is_initiliaze: bool) {
         debug!("registering request {}", id);
         let inflight = InFlightRequest {
             expected_responses: expected_count,
@@ -306,23 +332,23 @@ impl RegistryActor {
                     child_id,
                     mut response,
                 } => {
-                    debug!("in actor! PushResponse {} {}", id, child_id);
+                    debug!("in actor, PushResponse {} {}", id, child_id);
                     let id_clone = id.clone();
                     if let Entry::Occupied(mut occupied_entry) = self.requests.entry(id) {
                         let req = occupied_entry.get_mut();
                         if req.is_initialize {
-                            debug!("is initialize {}", response);
+                            trace!("is initialize {}", response);
                             if let Some(result) = response.get_mut("result")
                                 && let Some(caps_json) = result.get("capabilities")
                             {
                                 let caps: ServerCapabilities =
                                     serde_json::from_value(caps_json.clone()).unwrap_or_default();
-                                debug!(
+                                trace!(
                                     "found capabilities child id: {}; caps {:?}",
                                     child_id, caps
                                 );
-                                let current = self.servers.remove(&child_id).unwrap();
-                                self.servers.insert(
+                                let current = self.child_skills.remove(&child_id).unwrap();
+                                self.child_skills.insert(
                                     child_id,
                                     ServerSkills {
                                         capabilities: Some(caps),
@@ -369,8 +395,8 @@ impl RegistryActor {
                             .context("Output task died");
                     }
                 }
-                RegistryCommand::RegisterServer { id, tx } => {
-                    self.servers.insert(
+                RegistryCommand::RegisterChild { id, tx } => {
+                    self.child_skills.insert(
                         id,
                         ServerSkills {
                             tx,
@@ -378,9 +404,21 @@ impl RegistryActor {
                         },
                     );
                 }
-                RegistryCommand::RouteMessage { message } => self.handle_route(message).await,
-                RegistryCommand::RegisterServerRequest { id, child_id } => {
-                    self.server_requests.insert((id, child_id));
+                RegistryCommand::RouteMessage { message } => {
+                    self.handle_client_message(message).await
+                }
+                RegistryCommand::RegisterChildRequest {
+                    orig_id,
+                    new_id,
+                    child_id,
+                } => {
+                    self.child_requests.insert(
+                        new_id,
+                        InFlightChildRequest {
+                            orig_req_id: orig_id,
+                            child_id,
+                        },
+                    );
                 }
             }
         }
@@ -437,7 +475,7 @@ async fn child_stdin_worker(mut stdin: ChildStdin, mut input: mpsc::Receiver<Val
     }
 }
 
-fn merge_values(responses: &Vec<Value>, id: LspId) -> Value {
+fn merge_values(responses: &Vec<Value>, id: RequestId) -> Value {
     let error_response = responses.iter().find(|r| r.get("error").is_some());
     if let Some(error) = error_response {
         return error.clone();
@@ -497,28 +535,35 @@ async fn child_stdout_worker(
         let message: Result<Value> =
             serde_json::from_slice(&body).context("Failed to parse input as LSP data");
         match message {
-            Ok(message) => {
+            Ok(mut message) => {
                 if let Some(id_val) = message.get("id") {
-                    let lsp_id: LspId = serde_json::from_value(id_val.clone()).unwrap();
+                    let msg_id: RequestId = serde_json::from_value(id_val.clone()).unwrap();
+                    debug!("Got message from child with id {}", msg_id);
                     if !message.get("method").is_some() {
-                        debug!("got response from child_id: {} {}", child_id, message);
-                        handle.push_response(lsp_id, child_id, message).await
+                        trace!("got response from child_id: {} {}", child_id, message);
+                        handle.push_response(msg_id, child_id, message).await
                     } else {
-                        debug!("got request from child_id: {} {}", child_id, message);
-                        handle.register_server_request(lsp_id, child_id).await;
-                        let _ = output_tx
-                            .send(serde_json::to_string(&message).unwrap())
+                        trace!("got request from child_id: {} {}", child_id, message);
+                        let new_id =
+                            RequestId::String(format!("{}{}", (child_id + 1) * 100, msg_id));
+                        debug!("request id change from {} to {}", msg_id, new_id);
+                        handle
+                            .register_child_request(new_id.clone(), msg_id, child_id)
                             .await;
+                        let repl = message.as_object_mut().expect("Should be an object!");
+                        repl.remove("id");
+                        repl.insert("id".to_string(), serde_json::to_value(new_id).unwrap());
+                        let _ = output_tx.send(serde_json::to_string(&repl).unwrap()).await;
                     }
                 } else {
-                    debug!("got notification from server: {}", message);
+                    trace!("got notification from server: {}", message);
                     let _ = output_tx
                         .send(serde_json::to_string(&message).unwrap())
                         .await;
                 }
             }
             Err(e) => {
-                debug!("Child {} stdout closed: {}", child_id, e);
+                error!("Child {} stdout closed: {}", child_id, e);
                 break;
             }
         }
@@ -530,15 +575,15 @@ async fn output_actor(mut rx: mpsc::Receiver<String>) {
     while let Some(message) = rx.recv().await {
         let header = format!("Content-Length: {}\r\n\r\n", message.len());
         if let Err(e) = stdout.write_all(header.as_bytes()).await {
-            debug!("Failed to write header to stdout: {}", e);
+            error!("Failed to write header to stdout: {}", e);
             break;
         }
         if let Err(e) = stdout.write_all(message.as_bytes()).await {
-            debug!("Failed to write body to stdout: {}", e);
+            error!("Failed to write body to stdout: {}", e);
             break;
         }
         if let Err(e) = stdout.flush().await {
-            debug!("Failed to flush stdout: {}", e);
+            error!("Failed to flush stdout: {}", e);
             break;
         }
     }
@@ -604,18 +649,18 @@ async fn run(config: LspConfig) -> Result<()> {
         let content_length = match read_content_length(&mut stdin).await {
             Ok(len) => len,
             Err(e) => {
-                info!("Stdin closed: {}", e);
+                error!("Stdin closed: {}", e);
                 break;
             }
         };
         let mut body = vec![0u8; content_length];
         if let Err(e) = stdin.read_exact(&mut body).await {
-            debug!("Failed to read body from stdin: {}", e);
+            error!("Failed to read body from stdin: {}", e);
             break;
         }
         let raw = String::from_utf8(body)?;
         let message: Value = serde_json::from_str(&raw)?;
-        debug!("Got client message: {}", message);
+        trace!("Got client message: {}", message);
         registry_handle.route(message).await;
     }
     Ok(())
