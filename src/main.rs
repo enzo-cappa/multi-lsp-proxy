@@ -121,6 +121,23 @@ impl Server {
                     | "initialized"
                     | "exit" => true,
 
+                    // Inside LspRouter::server_supports_method
+                    "codeAction/resolve" => {
+                        caps.code_action_provider.as_ref().map_or(false, |p| {
+                            match p {
+                                CodeActionProviderCapability::Simple(enabled) => {
+                                    // If it's just a boolean 'true', it usually doesn't
+                                    // imply resolve support in older LSP versions.
+                                    *enabled
+                                }
+                                CodeActionProviderCapability::Options(opt) => {
+                                    // This is the modern way: check the resolve_provider flag
+                                    opt.resolve_provider.unwrap_or(false)
+                                }
+                            }
+                        })
+                    }
+
                     // --- Default Fallback ---
                     // If it's a $/ method (private/custom) or something unknown,
                     // broadcasting is usually safer than dropping.
