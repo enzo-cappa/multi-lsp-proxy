@@ -44,4 +44,32 @@ command = "ruff-lsp"
         assert_eq!(conf.languages[1].command, PathBuf::from("ruff-lsp"));
         assert_eq!(conf.languages[1].args.len(), 0);
     }
+
+    #[test]
+    fn test_parse_config_with_log_file() {
+        let config = r#"
+log-file = "/tmp/multi-lsp.log"
+
+[[language]]
+name = "python"
+command = "pylsp"
+        "#;
+
+        let conf: LspConfig = toml_edit::easy::from_str(config).unwrap();
+        assert_eq!(conf.log_file, Some(PathBuf::from("/tmp/multi-lsp.log")));
+        assert_eq!(conf.languages.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_config_with_args() {
+        let config = r#"
+[[language]]
+name = "pyright"
+command = "pyright-langserver"
+args = ["--stdio", "--verbose"]
+        "#;
+
+        let conf: LspConfig = toml_edit::easy::from_str(config).unwrap();
+        assert_eq!(conf.languages[0].args, vec!["--stdio", "--verbose"]);
+    }
 }

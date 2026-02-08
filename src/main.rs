@@ -582,6 +582,27 @@ async fn child_stdout_worker(
                         let repl = message.as_object_mut().expect("Should be an object!");
                         repl.remove("id");
                         repl.insert("id".to_string(), serde_json::to_value(new_id).unwrap());
+                        let method = repl.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                        if method == "textDocument/publishDiagnostics" {
+                            if let Some(params) = repl.get_mut("params") {
+                                if let Some(diagnostics) =
+                                    params.get_mut("diagnostics").and_then(|d| d.as_array_mut())
+                                {
+                                    for diagnostic in diagnostics {
+                                        // Get the existing source (e.g., "rust-analyzer" or "pyright")
+                                        let original_source = diagnostic
+                                            .get("source")
+                                            .and_then(|s| s.as_str())
+                                            .unwrap_or("lsp");
+
+                                        // Tag it so the client treats them as distinct collections
+
+                                        diagnostic["source"] =
+                                            json!(format!("{}:{}", "mlp", original_source));
+                                    }
+                                }
+                            }
+                        }
                         let _ = output_tx.send(serde_json::to_string(&repl).unwrap()).await;
                     }
                 } else {
@@ -630,7 +651,7 @@ async fn run(config: LspConfig) -> Result<()> {
         _tracing_guard = Some(guard);
 
         let env_filter = EnvFilter::builder()
-            .with_default_directive(LevelFilter::DEBUG.into())
+            .with_default_directive(LevelFilter::TRACE.into())
             .from_env_lossy();
         tracing_subscriber::fmt()
             .with_writer(non_blocking)
@@ -704,6 +725,279 @@ struct Cli {
     /// Select language servers by programming language name
     #[arg(short = 'l', long)]
     language: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── merge_values ──────────────────────────────────────────────
+
+    #[test]
+    fn merge_single_response_passthrough() {
+        let responses = vec![json!({"jsonrpc":"2.0","id":1,"result":{"hover":"hello"}})];
+        let merged = merge_values(&responses, RequestId::Number(1));
+        assert_eq!(merged["result"]["hover"], "hello");
+    }
+
+    #[test]
+    fn merge_arrays_concatenated() {
+        let responses = vec![
+            json!({"jsonrpc":"2.0","id":1,"result":[1,2]}),
+            json!({"jsonrpc":"2.0","id":1,"result":[3,4]}),
+        ];
+        let merged = merge_values(&responses, RequestId::Number(1));
+        assert_eq!(merged["result"], json!([1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn merge_objects_deep_merged() {
+        let responses = vec![
+            json!({"jsonrpc":"2.0","id":1,"result":{"a":1}}),
+            json!({"jsonrpc":"2.0","id":1,"result":{"b":2}}),
+        ];
+        let merged = merge_values(&responses, RequestId::Number(1));
+        assert_eq!(merged["result"]["a"], 1);
+        assert_eq!(merged["result"]["b"], 2);
+    }
+
+    #[test]
+    fn merge_error_takes_precedence() {
+        let responses = vec![
+            json!({"jsonrpc":"2.0","id":1,"result":{"a":1}}),
+            json!({"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"bad"}}),
+        ];
+        let merged = merge_values(&responses, RequestId::Number(1));
+        assert!(merged.get("error").is_some());
+        assert_eq!(merged["error"]["code"], -32600);
+    }
+
+    #[test]
+    fn merge_null_results_ignored() {
+        let responses = vec![
+            json!({"jsonrpc":"2.0","id":1,"result":null}),
+            json!({"jsonrpc":"2.0","id":1,"result":{"a":1}}),
+        ];
+        let merged = merge_values(&responses, RequestId::Number(1));
+        assert_eq!(merged["result"]["a"], 1);
+    }
+
+    #[test]
+    fn merge_all_null_results() {
+        let responses = vec![
+            json!({"jsonrpc":"2.0","id":1,"result":null}),
+            json!({"jsonrpc":"2.0","id":1,"result":null}),
+        ];
+        let merged = merge_values(&responses, RequestId::Number(1));
+        assert!(merged["result"].is_null());
+    }
+
+    #[test]
+    fn merge_empty_responses() {
+        let responses = vec![];
+        let merged = merge_values(&responses, RequestId::Number(1));
+        assert!(merged["result"].is_null());
+    }
+
+    // ── Server::server_supports_method ────────────────────────────
+
+    fn make_server(caps: Option<ServerCapabilities>) -> Server {
+        let (tx, _rx) = mpsc::channel(1);
+        Server {
+            capabilities: caps,
+            tx,
+        }
+    }
+
+    #[test]
+    fn supports_method_no_capabilities_returns_false() {
+        let server = make_server(None);
+        assert!(!server.server_supports_method("textDocument/hover"));
+        assert!(!server.server_supports_method("textDocument/completion"));
+    }
+
+    #[test]
+    fn supports_method_hover() {
+        let mut caps = ServerCapabilities::default();
+        caps.hover_provider = Some(HoverProviderCapability::Simple(true));
+        let server = make_server(Some(caps));
+        assert!(server.server_supports_method("textDocument/hover"));
+        assert!(!server.server_supports_method("textDocument/completion"));
+    }
+
+    #[test]
+    fn supports_method_completion() {
+        let mut caps = ServerCapabilities::default();
+        caps.completion_provider = Some(CompletionOptions::default());
+        let server = make_server(Some(caps));
+        assert!(server.server_supports_method("textDocument/completion"));
+        assert!(!server.server_supports_method("textDocument/hover"));
+    }
+
+    #[test]
+    fn supports_method_lifecycle_always_true() {
+        let caps = ServerCapabilities::default();
+        let server = make_server(Some(caps));
+        for method in &[
+            "textDocument/didOpen",
+            "textDocument/didChange",
+            "textDocument/didSave",
+            "textDocument/didClose",
+            "initialized",
+            "exit",
+        ] {
+            assert!(server.server_supports_method(method), "{} should be true", method);
+        }
+    }
+
+    #[test]
+    fn supports_method_code_action_resolve_with_resolve_provider() {
+        let mut caps = ServerCapabilities::default();
+        caps.code_action_provider = Some(CodeActionProviderCapability::Options(CodeActionOptions {
+            resolve_provider: Some(true),
+            ..Default::default()
+        }));
+        let server = make_server(Some(caps));
+        assert!(server.server_supports_method("codeAction/resolve"));
+    }
+
+    #[test]
+    fn supports_method_code_action_resolve_without_resolve_provider() {
+        let mut caps = ServerCapabilities::default();
+        caps.code_action_provider = Some(CodeActionProviderCapability::Options(CodeActionOptions {
+            resolve_provider: None,
+            ..Default::default()
+        }));
+        let server = make_server(Some(caps));
+        assert!(!server.server_supports_method("codeAction/resolve"));
+    }
+
+    #[test]
+    fn supports_method_semantic_tokens_full() {
+        let mut caps = ServerCapabilities::default();
+        caps.semantic_tokens_provider =
+            Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+                SemanticTokensOptions {
+                    full: Some(SemanticTokensFullOptions::Bool(true)),
+                    range: None,
+                    ..Default::default()
+                },
+            ));
+        let server = make_server(Some(caps));
+        assert!(server.server_supports_method("textDocument/semanticTokens/full"));
+        assert!(!server.server_supports_method("textDocument/semanticTokens/range"));
+    }
+
+    #[test]
+    fn supports_method_semantic_tokens_range() {
+        let mut caps = ServerCapabilities::default();
+        caps.semantic_tokens_provider =
+            Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+                SemanticTokensOptions {
+                    full: None,
+                    range: Some(true),
+                    ..Default::default()
+                },
+            ));
+        let server = make_server(Some(caps));
+        assert!(!server.server_supports_method("textDocument/semanticTokens/full"));
+        assert!(server.server_supports_method("textDocument/semanticTokens/range"));
+    }
+
+    #[test]
+    fn supports_method_unknown_defaults_true() {
+        let caps = ServerCapabilities::default();
+        let server = make_server(Some(caps));
+        assert!(server.server_supports_method("$/customNotification"));
+        assert!(server.server_supports_method("someUnknownMethod"));
+    }
+
+    // ── RequestId ─────────────────────────────────────────────────
+
+    #[test]
+    fn request_id_display_number() {
+        let id = RequestId::Number(123);
+        assert_eq!(format!("{}", id), "123");
+    }
+
+    #[test]
+    fn request_id_display_string() {
+        let id = RequestId::String("abc".into());
+        assert_eq!(format!("{}", id), "\"abc\"");
+    }
+
+    #[test]
+    fn request_id_serde_roundtrip_number() {
+        let id = RequestId::Number(42);
+        let serialized = serde_json::to_string(&id).unwrap();
+        let deserialized: RequestId = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(id, deserialized);
+    }
+
+    #[test]
+    fn request_id_serde_roundtrip_string() {
+        let id = RequestId::String("req-1".into());
+        let serialized = serde_json::to_string(&id).unwrap();
+        let deserialized: RequestId = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(id, deserialized);
+    }
+
+    // ── Message deserialization ───────────────────────────────────
+
+    #[test]
+    fn message_deser_request() {
+        let json = json!({"jsonrpc":"2.0","id":1,"method":"textDocument/hover"});
+        let msg: Message = serde_json::from_value(json).unwrap();
+        assert!(matches!(msg, Message::Request { .. }));
+    }
+
+    #[test]
+    fn message_deser_response() {
+        let json = json!({"jsonrpc":"2.0","id":1,"result":{"a":1}});
+        let msg: Message = serde_json::from_value(json).unwrap();
+        assert!(matches!(msg, Message::Response { .. }));
+    }
+
+    #[test]
+    fn message_deser_error() {
+        let json = json!({"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"bad"}});
+        let msg: Message = serde_json::from_value(json).unwrap();
+        assert!(matches!(msg, Message::Error { .. }));
+    }
+
+    #[test]
+    fn message_deser_notification() {
+        let json = json!({"jsonrpc":"2.0","method":"initialized"});
+        let msg: Message = serde_json::from_value(json).unwrap();
+        assert!(matches!(msg, Message::Notification { .. }));
+    }
+
+    // ── read_content_length ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn read_content_length_valid() {
+        let input = b"Content-Length: 42\r\n\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let len = read_content_length(&mut reader).await.unwrap();
+        assert_eq!(len, 42);
+    }
+
+    #[tokio::test]
+    async fn read_content_length_missing_header() {
+        let input = b"Content-Type: application/json\r\n\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let result = read_content_length(&mut reader).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_content_length_empty_input() {
+        let input = b"";
+        let mut reader = BufReader::new(&input[..]);
+        let result = read_content_length(&mut reader).await;
+        assert!(result.is_err());
+    }
 }
 
 #[tokio::main]
